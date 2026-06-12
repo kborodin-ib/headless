@@ -2,7 +2,7 @@
 
 ## Overview
 
-`setup_x11_gui.py` automates the setup of a headless X11 graphical desktop environment on a remote Linux server (originally targeting AWS EC2). It installs the required packages, starts a virtual display, exposes it over VNC, and wraps it in a browser-accessible noVNC interface — all in a single command.
+`setup_vnc.py` automates the setup of a headless X11 graphical desktop environment on a remote Linux server (originally targeting AWS EC2). It installs the required packages, starts a virtual display, exposes it over VNC, and wraps it in a browser-accessible noVNC interface — all in a single command.
 
 ---
 
@@ -18,13 +18,13 @@
 
 ```bash
 # Full setup with a VNC password (recommended)
-python3 setup_x11_gui.py --vnc-password mysecretpass
+python3 setup_vnc_gui.py --vnc-password mysecretpass
 
 # Skip package installation if dependencies are already installed
-python3 setup_x11_gui.py --no-install --vnc-password mysecretpass
+python3 setup_vnc_gui.py --no-install --vnc-password mysecretpass
 
 # Custom screen resolution
-python3 setup_x11_gui.py --resolution 1280x720x24 --vnc-password mysecretpass
+python3 setup_vnc_gui.py --resolution 1280x720x24 --vnc-password mysecretpass
 ```
 
 Once running, open the GUI in any browser:
