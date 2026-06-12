@@ -1,4 +1,4 @@
-# setup_x11_gui.py — Documentation
+# setup_vnc.py — Documentation
 
 ## Overview
 
