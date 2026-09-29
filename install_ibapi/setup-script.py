@@ -10,11 +10,12 @@ from io import BytesIO
 from fix_proto_imports import update_pb2_imports
 import glob
 import argparse
+import parse_version
 
-API_VERSION = sys.argv[2] 
+API_CHANNEL = sys.argv[2] 
 CASE_NAME = sys.argv[1] 
 PATH = os.path.expanduser(f"~/docs/api/cases/{CASE_NAME}")
-DOWNLOAD_LINK = f"https://interactivebrokers.github.io/downloads/twsapi_macunix.{API_VERSION}.01.zip"
+#DOWNLOAD_LINK = f"https://interactivebrokers.github.io/downloads/twsapi_macunix.{API_VERSION}.01.zip"
 SOURCE_PATH = os.path.join(PATH, "/IBJts/source")
 ssl_context = ssl.create_default_context()
 ssl_context.check_hostname = False
@@ -40,7 +41,26 @@ def create_case_dir():
     except Exception as err:
         print(f"Error {err}")
 
-def download_source(url=DOWNLOAD_LINK, tartget_dir=PATH, version=API_VERSION):
+def get_download_url():
+    versions = {}
+    try:
+        rels = parse_version.fetch_linux_api_versions()
+        print(rels)
+    except Exception as e:
+        print(f"Failed to fetch {e}", file=sys.stderr)
+    if not rels:
+        print("No matching linux TWS API downloads found", file=sys.stderr)
+    for r in rels:
+        versions[r.channel] = r.url
+    return versions
+
+def download_source(tartget_dir=PATH):
+    urls = get_download_url()
+    print(urls)
+    allowed = ['latest', 'stable']
+    if API_CHANNEL not in allowed:
+        print(f"[+] allowed args are 'latest' and 'stable'")
+    url = urls[API_CHANNEL]
     try:
         with urlopen(url, context=ssl_context) as response:
             total_size = response.headers.get('content-length')

@@ -14,13 +14,15 @@ import urllib.request
 from dataclasses import dataclass
 
 BASE = "https://interactivebrokers.github.io"
+HOST = "interactivebrokers.github.io"
 INDEX_URL = BASE + "/"
 
 # twsapi_macunix.1045.01.zip -> ("1045", "01")
-_MACUNIX_RE = re.compile(
-    r'href\s*=\s*["\']([^"\']*?twsapi_macunix\.(\d+)\.(\d+)\.zip)["\']',
-    re.IGNORECASE,
-)
+#_MACUNIX_RE = re.compile(
+#    r'href\s*=\s*["\']([^"\']*?twsapi_macunix\.(\d+)\.(\d+)\.zip)["\']',
+#    re.IGNORECASE,
+#)
+_MACUNIX_RE = re.compile(r'href\s*=\s*["\']([^"\']*?twsapi_(?:macunix\.)?(\d+)[._](\d+)\.zip)["\']')
 
 
 @dataclass(frozen=True)
@@ -38,13 +40,27 @@ def _pretty_version(major_minor: str, build: str) -> str:
 
 
 def _classify_channel(html: str, match_start: int) -> str:
-    """Best-effort: nearest 'Stable' / 'Latest'/'Beta' heading before the link."""
-    window = html[max(0, match_start - 600): match_start].lower()
-    stable = window.rfind("stable")
-    latest = max(window.rfind("latest"), window.rfind("beta"))
-    if stable == -1 and latest == -1:
-        return "unknown"
-    return "stable" if stable > latest else "latest"
+    # channel keyword now lives in the anchor's visible text, AFTER the href,
+    # so look FORWARD and stop at the anchor's own closing tag
+    end = html.find('</a>', match_start)
+    window = html[match_start : end if end != -1 else match_start + 300].lower()
+    b, l, s = window.rfind('beta'), window.rfind('latest'), window.rfind('stable')
+    idx = max(b, l, s)
+    if idx == -1:
+        return 'unknown'
+    return {b: 'beta', l: 'latest', s: 'stable'}[idx]
+
+def absolutize(href: str) -> str:
+    """Build a correct absolute URL from any href shape, without doubling the host."""
+    href = href.strip()
+    if href.startswith(("http://", "https://")):
+        return href                      # already absolute
+    if href.startswith("//"):
+        return "https:" + href           # protocol-relative
+    stripped = href.lstrip("/")          # normalize /path and //path
+    if stripped.lower().startswith(HOST + "/"):
+        stripped = stripped[len(HOST):]  # drop embedded host, keep the rest
+    return BASE + "/" + stripped.lstrip("/")
 
 
 def fetch_linux_api_versions(url: str = INDEX_URL, timeout: int = 20) -> list[ApiRelease]:
@@ -56,7 +72,7 @@ def fetch_linux_api_versions(url: str = INDEX_URL, timeout: int = 20) -> list[Ap
     releases: dict[str, ApiRelease] = {}
     for m in _MACUNIX_RE.finditer(html):
         href, mm, build = m.group(1), m.group(2), m.group(3)
-        abs_url = href if href.startswith("http") else BASE + "/" + href.lstrip("/")
+        abs_url = absolutize(href) 
         raw = f"{mm}.{build}"
         releases[raw] = ApiRelease(_pretty_version(mm, build), raw,
                                    _classify_channel(html, m.start()), abs_url)
