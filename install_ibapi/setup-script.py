@@ -17,6 +17,8 @@ CASE_NAME = sys.argv[1]
 PATH = os.path.expanduser(f"~/docs/api/cases/{CASE_NAME}")
 #DOWNLOAD_LINK = f"https://interactivebrokers.github.io/downloads/twsapi_macunix.{API_VERSION}.01.zip"
 SOURCE_PATH = os.path.join(PATH, "/IBJts/source")
+if API_CHANNEL == 'latest':
+    SOURCE_PATH = "/source"
 ssl_context = ssl.create_default_context()
 ssl_context.check_hostname = False
 ssl_context.verify_mode = ssl.CERT_NONE
