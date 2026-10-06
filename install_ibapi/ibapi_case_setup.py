@@ -10,9 +10,10 @@ Merges three former scripts:
 
 What `setup` does:
   1. creates ~/docs/api/cases (if missing) and ~/docs/api/cases/<case>
-  2. checks the IBKR download page for the API versions currently offered,
-     accepts only one of those (stable, latest, 1050 or 1050.02), then
-     downloads and extracts twsapi_macunix.<version>.<patch>.zip
+  2. reads the IBKR download page for the Linux packages currently offered
+     (Stable and Latest), accepts only one of those (stable, latest, 1051
+     or 1051.01), downloads the Linux installer and unpacks it into
+     <case>/tws-api/<version>/
   3. creates a virtualenv in <case>/.venv
      (Debian 12+ / Ubuntu 23.04+ refuse system-wide pip installs, PEP 668)
   4. compiles IBJts/source/proto/*.proto into pythonclient/ibapi/protobuf
@@ -24,7 +25,7 @@ What `setup` does:
 
 Usage:
   python3 ibapi_case_setup.py versions                    # list available API versions
-  python3 ibapi_case_setup.py setup --case my_case --api-version stable
+  python3 ibapi_case_setup.py setup --case my_case --api-version latest
   python3 ibapi_case_setup.py my_case 1051                # legacy positional form
   python3 ibapi_case_setup.py fix-imports ./some/dir
   python3 ibapi_case_setup.py pip-install requests --python ~/docs/api/cases/my_case/.venv/bin/python
@@ -42,13 +43,15 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tarfile
 import venv
 import zipfile
-from dataclasses import dataclass
-from io import BytesIO
+from dataclasses import dataclass, field, replace
+from html import unescape
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 from urllib.error import URLError
+from urllib.parse import unquote, urljoin, urlsplit
 from urllib.request import urlopen
 
 __version__ = "1.0.0"
@@ -56,13 +59,21 @@ __version__ = "1.0.0"
 log = logging.getLogger("ibapi_case_setup")
 
 DEFAULT_BASE_DIR = "~/docs/api/cases"
-DOWNLOAD_URL_TEMPLATE = (
-    "https://interactivebrokers.github.io/downloads/twsapi_macunix.{version}.{patch}.zip"
+# IBKR download page that lists the API packages currently offered.
+DOWNLOAD_INDEX_URL = "https://download2.interactivebrokers.com/installers/tws-api/index.html"
+# Package links are only followed to these hosts (and their subdomains), over https.
+TRUSTED_DOWNLOAD_HOSTS = ("interactivebrokers.com", "interactivebrokers.github.io")
+HREF_RE = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+# Linux packages, e.g. tws-api-latest-linux-x64.sh (also the older twsapi_macunix.X.Y.zip)
+LINUX_PACKAGE_NAME_RE = re.compile(
+    r"(?i)(?:linux[^/]*\.(?:sh|zip|tar\.gz|tgz)|twsapi_macunix\.\d{3,5}\.\d{2}\.zip)$"
 )
-DOWNLOAD_INDEX_URL = "https://interactivebrokers.github.io/"
-# Package links on the download page; must stay in sync with DOWNLOAD_URL_TEMPLATE.
-RELEASE_LINK_RE = re.compile(r"twsapi_macunix\.(\d{3,5})\.(\d{2})\.zip", re.IGNORECASE)
-LABEL_RE = re.compile(r"\b(Stable|Latest)\b", re.IGNORECASE)
+VERSION_IN_NAME_RE = re.compile(r"(?i)twsapi_macunix\.(\d{3,5})\.(\d{2})\.zip$")
+# Section header text: "Version: <strong>1051.01</strong>"
+VERSION_TEXT_RE = re.compile(r"(?i)Version:\s*(?:&nbsp;|\s|<[^>]*>)*(\d{3,5})\.(\d{2})\b")
+# Section title: "<h2><span>Latest</span></h2>"
+SECTION_LABEL_RE = re.compile(r"(?i)<h[1-6][^>]*>\s*(?:<[^>]*>\s*)*(Stable|Latest)\b")
+LABEL_IN_URL_RE = re.compile(r"(?i)(?:^|[/_.-])(stable|latest)(?=[/_.-]|$)")
 PROTOBUF_REQUIREMENT = "protobuf==5.29.5"
 GRPCIO_TOOLS_REQUIREMENT = "grpcio-tools==1.71.0"  # bundles a protoc matching protobuf 5.29
 TRUSTED_HOSTS = ("pypi.org", "pypi.python.org", "files.pythonhosted.org")
@@ -82,9 +93,15 @@ class SetupError(RuntimeError):
 
 @dataclass(frozen=True)
 class CasePaths:
-    """All filesystem locations for one case, derived from the case directory."""
+    """All filesystem locations for one case, derived from the case directory.
+
+    `source_root` is the folder that contains `pythonclient/` (and `proto/`).
+    It is found after the package is unpacked; the default is the classic
+    <case>/IBJts/source layout.
+    """
 
     case_dir: Path
+    source_root: Optional[Path] = None
 
     @classmethod
     def for_case(cls, case_name: str, base_dir: PathLike = DEFAULT_BASE_DIR) -> "CasePaths":
@@ -94,7 +111,16 @@ class CasePaths:
 
     @property
     def source_dir(self) -> Path:
-        return self.case_dir / "IBJts" / "source"
+        return self.source_root or self.case_dir / "IBJts" / "source"
+
+    @property
+    def packages_dir(self) -> Path:
+        """Unpacked API packages, one folder per version: <case>/tws-api/<version>."""
+        return self.case_dir / "tws-api"
+
+    @property
+    def downloads_dir(self) -> Path:
+        return self.case_dir / "downloads"
 
     @property
     def proto_dir(self) -> Path:
@@ -129,24 +155,19 @@ def ensure_base_dir(base_dir: PathLike = DEFAULT_BASE_DIR) -> Path:
     return base
 
 
-def build_download_url(api_version: str, patch: str = "01") -> str:
-    if not re.fullmatch(r"\d{3,5}", api_version or ""):
-        raise ValueError(f"API version must be digits like 1037, got {api_version!r}")
-    if not re.fullmatch(r"\d{2}", patch or ""):
-        raise ValueError(f"patch must be two digits like 01, got {patch!r}")
-    return DOWNLOAD_URL_TEMPLATE.format(version=api_version, patch=patch)
-
-
 # ------------------------------------------------------- available API versions
 
 
 @dataclass(frozen=True)
 class ApiRelease:
-    """One Mac/Linux API package offered on the IBKR download page."""
+    """One Linux API package offered on the IBKR download page."""
 
-    version: str  # e.g. "1050"
-    patch: str  # e.g. "02"
-    label: Optional[str] = None  # "stable" / "latest" when the page says so
+    version: str  # e.g. "1051"
+    patch: str  # e.g. "01"
+    label: Optional[str] = None  # "stable" / "latest"
+    # Exact link from the page. Not part of equality: a release is identified
+    # by its version, wherever it is hosted.
+    link: str = field(default="", compare=False)
 
     @property
     def full_version(self) -> str:
@@ -154,7 +175,7 @@ class ApiRelease:
 
     @property
     def url(self) -> str:
-        return build_download_url(self.version, self.patch)
+        return self.link
 
     def __str__(self) -> str:
         return f"{self.full_version} ({self.label})" if self.label else self.full_version
@@ -164,30 +185,68 @@ def _version_key(release: ApiRelease):
     return (int(release.version), int(release.patch))
 
 
-def parse_available_releases(html: str) -> List[ApiRelease]:
-    """Find every twsapi_macunix.<version>.<patch>.zip link on the download page.
+def is_trusted_download_url(url: str) -> bool:
+    """Only https links on IBKR-owned hosts may be downloaded."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and any(
+        host == h or host.endswith("." + h) for h in TRUSTED_DOWNLOAD_HOSTS
+    )
 
-    The Stable/Latest label is taken from the closest mention between the
-    previous package link and this one.
+
+def _url_basename(url: str) -> str:
+    return unquote(urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1])
+
+
+def parse_available_releases(html: str, index_url: str = DOWNLOAD_INDEX_URL) -> List[ApiRelease]:
+    """Find the Linux packages on the download page, with their version and label.
+
+    The page has one section per channel (Stable, Latest). Each section starts
+    with a title and "Version: 1051.01", followed by one link per platform. For
+    every Linux link, the version and label are the last ones that appear
+    between the previous Linux link and this one. Links are resolved against
+    `index_url`; links outside TRUSTED_DOWNLOAD_HOSTS are ignored, and so are
+    Linux links without a version (they could not be checked).
     """
     releases = {}
     prev_end = 0
-    for match in RELEASE_LINK_RE.finditer(html):
-        version, patch = match.group(1), match.group(2)
-        window = html[max(prev_end, match.start() - 2000): match.start()]
-        labels = LABEL_RE.findall(window)
-        label = labels[-1].lower() if labels else None
-        prev_end = match.end()
+    for m in HREF_RE.finditer(html):
+        link = urljoin(index_url, unescape(m.group(1)).strip())
+        name = _url_basename(link)
+        if not LINUX_PACKAGE_NAME_RE.search(name):
+            continue
+        window = html[prev_end: m.start()]
+        prev_end = m.end()
+        if not is_trusted_download_url(link):
+            log.warning("Ignoring package link on an untrusted host: %s", link)
+            continue
+
+        named = VERSION_IN_NAME_RE.search(name)
+        versions = VERSION_TEXT_RE.findall(window)
+        if named:
+            version, patch = named.groups()
+        elif versions:
+            version, patch = versions[-1]
+        else:
+            log.warning("Ignoring Linux package without a version on the page: %s", link)
+            continue
+
+        labels = SECTION_LABEL_RE.findall(window)
+        url_label = LABEL_IN_URL_RE.search(urlsplit(link).path)
+        label = (labels[-1] if labels else url_label.group(1) if url_label else "").lower() or None
+
         key = (version, patch)
-        if key not in releases or (releases[key].label is None and label):
-            releases[key] = ApiRelease(version, patch, label)
+        if key not in releases:
+            releases[key] = ApiRelease(version, patch, label, link)
+        elif releases[key].label is None and label:
+            releases[key] = ApiRelease(version, patch, label, releases[key].link)
     return sorted(releases.values(), key=_version_key)
 
 
 def fetch_available_releases(
     index_url: str = DOWNLOAD_INDEX_URL, insecure: bool = False, timeout: int = 30
 ) -> List[ApiRelease]:
-    """Download the IBKR API download page and return the packages it offers."""
+    """Download the IBKR API download page and return the Linux packages it offers."""
     log.info("Checking available API versions at %s", index_url)
     try:
         with urlopen(index_url, context=make_ssl_context(insecure), timeout=timeout) as resp:
@@ -202,11 +261,11 @@ def fetch_available_releases(
     except OSError as err:
         raise SetupError(f"could not load the list of API versions from {index_url}: {err}") from err
 
-    releases = parse_available_releases(html)
+    releases = parse_available_releases(html, index_url)
     if not releases:
         raise SetupError(
-            f"no twsapi_macunix packages found on {index_url}; "
-            "the page layout or DOWNLOAD_URL_TEMPLATE may be out of date"
+            f"no Linux API packages found on {index_url}; "
+            "the page layout or DOWNLOAD_INDEX_URL may be out of date"
         )
     return releases
 
@@ -214,7 +273,7 @@ def fetch_available_releases(
 def select_release(requested: str, releases: Sequence[ApiRelease]) -> ApiRelease:
     """Match the user's input against the available packages.
 
-    Accepts "stable", "latest", a version ("1050") or a full version ("1050.02").
+    Accepts "stable", "latest", a version ("1051") or a full version ("1051.01").
     Anything not currently offered on the download page is rejected.
     """
     wanted = (requested or "").strip().lower()
@@ -231,8 +290,8 @@ def select_release(requested: str, releases: Sequence[ApiRelease]) -> ApiRelease
     match = re.fullmatch(r"(\d{3,5})(?:\.(\d{2}))?", wanted)
     if not match:
         raise SetupError(
-            f"invalid API version {requested!r}: use stable, latest, a version like 1050 "
-            f"or a full version like 1050.02. Available: {available}"
+            f"invalid API version {requested!r}: use stable, latest, a version like 1051 "
+            f"or a full version like 1051.01. Available: {available}"
         )
     version, patch = match.groups()
     candidates = [r for r in releases if r.version == version and (patch is None or r.patch == patch)]
@@ -316,45 +375,143 @@ def make_ssl_context(insecure: bool = False) -> ssl.SSLContext:
     return ctx
 
 
+def _check_inside(dest: Path, name: str) -> None:
+    target = (dest / name).resolve()
+    if target != dest and dest not in target.parents:
+        raise SetupError(f"refusing to extract outside {dest}: {name}")
+
+
 def safe_extract(zf: zipfile.ZipFile, dest: Path) -> int:
     """Extract, refusing members that would land outside `dest`. Returns file count."""
     dest = Path(dest).resolve()
     members = zf.infolist()
     for member in members:
-        target = (dest / member.filename).resolve()
-        if target != dest and dest not in target.parents:
-            raise SetupError(f"refusing to extract outside {dest}: {member.filename}")
+        _check_inside(dest, member.filename)
     zf.extractall(dest)
     return sum(1 for m in members if not m.is_dir())
 
 
-def download_and_extract(url: str, dest: PathLike, insecure: bool = False, timeout: int = 120) -> int:
-    dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
+def safe_extract_tar(tf: tarfile.TarFile, dest: Path) -> int:
+    """Like safe_extract, for tar archives (also checks link targets)."""
+    dest = Path(dest).resolve()
+    members = tf.getmembers()
+    for member in members:
+        _check_inside(dest, member.name)
+        if member.issym() or member.islnk():
+            base = dest / Path(member.name).parent if member.issym() else dest
+            target = (base / member.linkname).resolve()
+            if target != dest and dest not in target.parents:
+                raise SetupError(f"refusing link that points outside {dest}: {member.name}")
+    if hasattr(tarfile, "data_filter"):
+        tf.extractall(dest, filter="data")
+    else:  # Python < 3.12 without the backported filter
+        tf.extractall(dest)
+    return sum(1 for m in members if m.isfile())
+
+
+def download_file(url: str, dest_dir: PathLike, insecure: bool = False, timeout: int = 120) -> Path:
+    """Stream `url` into dest_dir/<file name>. Returns the saved file."""
+    if not is_trusted_download_url(url):
+        raise SetupError(f"refusing to download from an untrusted location: {url}")
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target = dest_dir / (_url_basename(url) or "package")
+    partial = target.with_name(target.name + ".part")
     log.info("Downloading %s", url)
     try:
-        with urlopen(url, context=make_ssl_context(insecure), timeout=timeout) as resp:
+        with urlopen(url, context=make_ssl_context(insecure), timeout=timeout) as resp, open(partial, "wb") as out:
             size = resp.headers.get("Content-Length")
             if size:
                 log.info("Package size: %.1f MB", int(size) / 1e6)
-            data = resp.read()
+            shutil.copyfileobj(resp, out, 1024 * 1024)
     except URLError as err:
+        partial.unlink(missing_ok=True)
         if isinstance(getattr(err, "reason", None), ssl.SSLError):
             raise SetupError(
                 f"TLS verification failed for {url}: {err.reason}. "
                 "Behind an intercepting proxy? Re-run with --insecure."
             ) from err
-        raise SetupError(f"download failed for {url}: {err} (check the API version)") from err
-    except OSError as err:
         raise SetupError(f"download failed for {url}: {err}") from err
+    except OSError as err:
+        partial.unlink(missing_ok=True)
+        raise SetupError(f"download failed for {url}: {err}") from err
+    partial.replace(target)
+    log.info("Saved %s", target)
+    return target
 
-    try:
-        with zipfile.ZipFile(BytesIO(data)) as zf:
-            count = safe_extract(zf, dest)
-    except zipfile.BadZipFile as err:
-        raise SetupError(f"{url} did not return a valid zip archive") from err
-    log.info("Extracted %d files to %s", count, dest)
-    return count
+
+def detect_package_kind(package: PathLike) -> str:
+    """Return "zip", "tar", "makeself", "install4j" or "unknown".
+
+    Archives are checked first so that, where possible, the package is unpacked
+    without running the installer script at all.
+    """
+    package = Path(package)
+    if zipfile.is_zipfile(package):  # also finds a zip appended to a shell script
+        return "zip"
+    if tarfile.is_tarfile(package):
+        return "tar"
+    with open(package, "rb") as fh:
+        head = fh.read(64 * 1024)
+    if b"makeself" in head.lower():
+        return "makeself"
+    if b"install4j" in head.lower():
+        return "install4j"
+    return "unknown"
+
+
+def unpack_package(package: PathLike, dest: PathLike, timeout: int = 900) -> str:
+    """Unpack a downloaded Linux API package into `dest`. Returns the kind found."""
+    package, dest = Path(package), Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    kind = detect_package_kind(package)
+    log.info("Unpacking %s (%s) into %s", package.name, kind, dest)
+    if kind == "zip":
+        with zipfile.ZipFile(package) as zf:
+            safe_extract(zf, dest)
+    elif kind == "tar":
+        with tarfile.open(package) as tf:
+            safe_extract_tar(tf, dest)
+    elif kind == "makeself":
+        # Self-extracting archive: unpack only, never run its install step.
+        run(["sh", package, "--nox11", "--noexec", "--target", dest], timeout=timeout)
+    elif kind == "install4j":
+        # IBKR's TWS installers are install4j; -q = unattended, -dir = target folder.
+        try:
+            run(["sh", package, "-q", "-overwrite", "-dir", dest], timeout=timeout)
+        except SetupError as err:
+            raise SetupError(
+                f"the installer {package.name} failed in unattended mode:\n{err}\n"
+                f"Try running it by hand: sh {package} -q -dir {dest}"
+            ) from err
+    else:
+        raise SetupError(
+            f"don't know how to unpack {package.name}: not a zip, tar, makeself or install4j package. "
+            f"Check what it is with `head -c 3000 {package} | strings | head -40`."
+        )
+    return kind
+
+
+def find_source_root(root: PathLike) -> Optional[Path]:
+    """Find the folder that holds `pythonclient/ibapi` under `root` (shallowest wins)."""
+    root = Path(root)
+    found: List[Path] = []
+    for dirpath, dirnames, _ in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".venv", "__pycache__", "node_modules")]
+        if "pythonclient" in dirnames and (Path(dirpath) / "pythonclient" / "ibapi").is_dir():
+            found.append(Path(dirpath))
+    return min(found, key=lambda p: (len(p.parts), str(p))) if found else None
+
+
+def read_package_version(source_root: Path) -> Optional[str]:
+    """Version from IBJts/API_VersionNum.txt (e.g. "API_Version=10.51.01" -> "1051.01")."""
+    for folder in (source_root, *list(source_root.parents)[:3]):
+        f = folder / "API_VersionNum.txt"
+        if f.is_file():
+            m = re.search(r"(\d+)\.(\d{2})\.(\d{2})", f.read_text(errors="replace"))
+            if m:
+                return f"{m.group(1)}{m.group(2)}.{m.group(3)}"
+    return None
 
 
 # ------------------------------------------------------------------- 4. virtualenv
@@ -458,11 +615,41 @@ def verify_install(python: PathLike) -> str:
 # -------------------------------------------------------------------- commands
 
 
+def prepare_source(paths: CasePaths, release: ApiRelease, insecure: bool = False, force: bool = False) -> CasePaths:
+    """Make sure the release is unpacked under <case>/tws-api/<version>; return paths pointing at it."""
+    package_dir = paths.packages_dir / release.full_version
+    source_root = find_source_root(package_dir) if package_dir.is_dir() else None
+
+    if source_root and not force:
+        log.info("API %s already unpacked, skipping download (use --force-download to refresh)", release)
+    else:
+        if package_dir.exists():
+            log.info("Removing previous unpack of %s: %s", release.full_version, package_dir)
+            shutil.rmtree(package_dir)
+        package = download_file(release.url, paths.downloads_dir / release.full_version, insecure=insecure)
+        unpack_package(package, package_dir)
+        source_root = find_source_root(package_dir)
+
+    if source_root is None:
+        hint = " IBKR currently ships the Python API only in Latest; try `-a latest`." if release.label != "latest" else ""
+        raise SetupError(
+            f"no Python API (pythonclient/ibapi) found in the {release} package under {package_dir}.{hint}"
+        )
+
+    found = read_package_version(source_root)
+    if found and found != release.full_version:
+        log.warning(
+            "The page lists %s, but the downloaded package says %s (IBKR may have updated it since).",
+            release.full_version, found,
+        )
+    log.info("API source: %s", source_root)
+    return replace(paths, source_root=source_root)
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     paths = CasePaths.for_case(args.case, args.base_dir)
     releases = fetch_available_releases(insecure=args.insecure)
     release = select_release(args.api_version, releases)
-    url = release.url
     log.info("Selected API version %s", release)
     ensure_base_dir(args.base_dir)
     if paths.case_dir.is_dir():
@@ -471,12 +658,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         paths.case_dir.mkdir()
         log.info("Created case directory: %s", paths.case_dir)
 
-    if paths.source_dir.is_dir() and not args.force_download:
-        log.info("Source already present, skipping download (use --force-download to refresh)")
-    else:
-        download_and_extract(url, paths.case_dir, insecure=args.insecure)
-    if not paths.pythonclient_dir.is_dir():
-        raise SetupError(f"expected {paths.pythonclient_dir} after extraction; archive layout changed?")
+    paths = prepare_source(paths, release, insecure=args.insecure, force=args.force_download)
 
     python = Path(args.python) if args.python else ensure_venv(paths.venv_dir)
 
@@ -546,13 +728,14 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  %(prog)s versions\n"
-            "  %(prog)s setup -c my_case -a stable\n"
-            "  %(prog)s setup -c my_case -a 1050\n"
+            "  %(prog)s setup -c my_case -a latest\n"
+            "  %(prog)s setup -c my_case -a 1051\n"
             "  %(prog)s my_case 1051.01\n"
             "  %(prog)s fix-imports ./IBJts/source/pythonclient/ibapi/protobuf\n"
             "  %(prog)s pip-install requests --python ~/docs/api/cases/my_case/.venv/bin/python\n"
             "\n"
-            "Only API versions currently listed on " + DOWNLOAD_INDEX_URL + " are accepted."
+            "Only the Linux API versions currently listed on " + DOWNLOAD_INDEX_URL + " are accepted.\n"
+            "IBKR currently ships the Python API only in the Latest package."
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -566,7 +749,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "-a",
         "--api-version",
-        help="stable, latest, a version like 1050, or a full version like 1050.02; "
+        help="stable, latest, a version like 1051, or a full version like 1051.01; "
         "must be listed by the `versions` command",
     )
     s.add_argument("--base-dir", default=DEFAULT_BASE_DIR, help=f"default: {DEFAULT_BASE_DIR}")
@@ -582,7 +765,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="protoc source (default: auto = system if found, else grpcio-tools)",
     )
     s.add_argument("--install-protoc", action="store_true", help="apt-get install protobuf-compiler if missing")
-    s.add_argument("--force-download", action="store_true", help="re-download even if source exists")
+    s.add_argument("--force-download", action="store_true", help="download and unpack again even if this version is already in the case")
 
     sub.add_parser("versions", parents=[common], help="list API versions available for download")
 
@@ -606,13 +789,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.case = args.case or args.case_pos
         args.api_version = args.api_version or args.version_pos
         if not args.case:
-            parser.error("setup needs a case name, e.g. `setup -c my_case -a stable`")
+            parser.error("setup needs a case name, e.g. `setup -c my_case -a latest`")
         if not args.api_version:
-            parser.error("setup needs an API version (-a stable, -a 1050); see the `versions` command")
+            parser.error("setup needs an API version (-a latest, -a 1051); see the `versions` command")
         if not VERSION_INPUT_RE.fullmatch(args.api_version):
             parser.error(
                 f"invalid API version {args.api_version!r}: use stable, latest, "
-                "a version like 1050 or a full version like 1050.02"
+                "a version like 1051 or a full version like 1051.01"
             )
         try:
             CasePaths.for_case(args.case, args.base_dir)
